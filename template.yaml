@@ -1,0 +1,305 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template for a web app that uploads files to S3 via pre-signed URLs'
+
+Parameters:
+  AppName:
+    Type: String
+    Default: s3-upload-app
+    Description: Name of the application
+  
+  EnvironmentName:
+    Type: String
+    Default: dev
+    Description: Environment name (dev, test, prod)
+    
+  BranchName:
+    Type: String
+    Default: main
+    Description: Repository branch name for Amplify app
+
+Resources:
+  # S3 bucket for storing the web app code
+  WebAppBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${AppName}-webapp-${AWS::AccountId}-${EnvironmentName}'
+      AccessControl: Private
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+
+  # S3 bucket for storing uploaded files
+  UploadsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${AppName}-uploads-${AWS::AccountId}-${EnvironmentName}'
+      AccessControl: Private
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders:
+              - '*'
+            AllowedMethods:
+              - GET
+              - PUT
+              - POST
+              - DELETE
+              - HEAD
+            AllowedOrigins:
+              - '*'
+            MaxAge: 3000
+
+  # Lambda function to generate pre-signed URLs
+  PresignedUrlFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AppName}-presigned-url-${EnvironmentName}'
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Timeout: 10
+      Environment:
+        Variables:
+          UPLOADS_BUCKET: !Ref UploadsBucket
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import uuid
+          from datetime import datetime
+          
+          s3_client = boto3.client('s3')
+          BUCKET_NAME = os.environ['UPLOADS_BUCKET']
+          
+          def handler(event, context):
+              try:
+                  # Parse request body
+                  body = json.loads(event['body']) if event.get('body') else {}
+                  file_name = body.get('fileName', '')
+                  file_type = body.get('fileType', '')
+                  
+                  if not file_name or not file_type:
+                      return {
+                          'statusCode': 400,
+                          'headers': {
+                              'Content-Type': 'application/json',
+                              'Access-Control-Allow-Origin': '*'
+                          },
+                          'body': json.dumps({'error': 'fileName and fileType are required'})
+                      }
+                  
+                  # Generate a unique key for the file
+                  timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
+                  unique_id = str(uuid.uuid4())[:8]
+                  file_extension = file_name.split('.')[-1] if '.' in file_name else ''
+                  key = f"uploads/{timestamp}_{unique_id}.{file_extension}" if file_extension else f"uploads/{timestamp}_{unique_id}"
+                  
+                  # Generate pre-signed URL
+                  presigned_url = s3_client.generate_presigned_url(
+                      'put_object',
+                      Params={
+                          'Bucket': BUCKET_NAME,
+                          'Key': key,
+                          'ContentType': file_type
+                      },
+                      ExpiresIn=300  # URL expires in 5 minutes
+                  )
+                  
+                  return {
+                      'statusCode': 200,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*'
+                      },
+                      'body': json.dumps({
+                          'uploadUrl': presigned_url,
+                          'key': key
+                      })
+                  }
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*'
+                      },
+                      'body': json.dumps({'error': str(e)})
+                  }
+
+  # IAM role for Lambda function
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AppName}-lambda-role-${EnvironmentName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3UploadAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                Resource: !Sub '${UploadsBucket.Arn}/*'
+
+  # API Gateway REST API
+  ApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${AppName}-api-${EnvironmentName}'
+      Description: API for generating pre-signed URLs
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  # API Gateway resource
+  ApiResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: 'generate-presigned-url'
+
+  # API Gateway method
+  ApiMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref ApiResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${PresignedUrlFunction.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: 'Empty'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # API Gateway OPTIONS method for CORS
+  ApiOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref ApiResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: 'Empty'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # API Gateway deployment
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - ApiMethod
+      - ApiOptionsMethod
+    Properties:
+      RestApiId: !Ref ApiGateway
+      StageName: !Ref EnvironmentName
+
+  # Lambda permission for API Gateway
+  LambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref PresignedUrlFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/${EnvironmentName}/POST/generate-presigned-url'
+
+  # Amplify App
+  AmplifyApp:
+    Type: AWS::Amplify::App
+    Properties:
+      Name: !Sub '${AppName}-${EnvironmentName}'
+      BuildSpec: |
+        version: 1
+        frontend:
+          phases:
+            build:
+              commands:
+                - echo "Building Amplify app"
+          artifacts:
+            baseDirectory: /
+            files:
+              - '**/*'
+          cache:
+            paths: []
+      CustomRules:
+        - Source: '</^[^.]+$|\\.(?!(css|gif|ico|jpg|js|png|txt|svg|woff|woff2|ttf|map|json)$)([^.]+$)/>'
+          Target: '/index.html'
+          Status: '200'
+      EnvironmentVariables:
+        - Name: API_ENDPOINT
+          Value: !Sub 'https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${EnvironmentName}/generate-presigned-url'
+        - Name: UPLOADS_BUCKET
+          Value: !Ref UploadsBucket
+
+  # Amplify Branch
+  AmplifyBranch:
+    Type: AWS::Amplify::Branch
+    Properties:
+      AppId: !GetAtt AmplifyApp.AppId
+      BranchName: !Ref BranchName
+      EnableAutoBuild: true
+
+Outputs:
+  WebAppBucketName:
+    Description: Name of the S3 bucket storing the web app code
+    Value: !Ref WebAppBucket
+    
+  UploadsBucketName:
+    Description: Name of the S3 bucket storing uploaded files
+    Value: !Ref UploadsBucket
+    
+  ApiEndpoint:
+    Description: URL of the API Gateway endpoint
+    Value: !Sub 'https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${EnvironmentName}/generate-presigned-url'
+    
+  AmplifyAppId:
+    Description: ID of the Amplify App
+    Value: !GetAtt AmplifyApp.AppId
+    
+  AmplifyAppURL:
+    Description: Default URL of the Amplify App
+    Value: !Sub 'https://${BranchName}.${AmplifyApp.DefaultDomain}'

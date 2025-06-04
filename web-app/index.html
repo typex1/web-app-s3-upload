@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>S3 File Upload App</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="container">
+        <h1>S3 File Upload</h1>
+        
+        <div class="upload-container">
+            <div class="file-input-container">
+                <input type="file" id="fileInput" class="file-input">
+                <label for="fileInput" class="file-label">Choose a file</label>
+                <span id="fileName" class="file-name">No file chosen</span>
+            </div>
+            
+            <button id="uploadButton" class="upload-button" disabled>Upload File</button>
+            
+            <div id="progressContainer" class="progress-container hidden">
+                <div id="progressBar" class="progress-bar"></div>
+                <div id="progressText" class="progress-text">0%</div>
+            </div>
+        </div>
+        
+        <div id="status" class="status"></div>
+        
+        <div id="uploadedFiles" class="uploaded-files">
+            <h2>Uploaded Files</h2>
+            <ul id="filesList"></ul>
+        </div>
+    </div>
+    
+    <script src="app.js"></script>
+</body>
+</html>
